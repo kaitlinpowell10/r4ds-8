@@ -21,10 +21,10 @@ print(history_data$schema)
 ## Main Forecasting Table
 
 ```{r}
-#| cache: true
 markets <- arrow::read_parquet("data/markets.parquet")
 
-history <- arrow::open_dataset("data/history.parquet")
+history <- arrow::open_dataset("data/history.parquet") |>
+  collect()
 
 joined <- history |>
   left_join(
@@ -37,8 +37,7 @@ joined <- history |>
       outcome == "NO" ~ 0,
       TRUE ~ NA_real_
     )
-  ) |>
-  collect()
+  )
 
 nrow(joined)
 ```
@@ -66,11 +65,116 @@ glimpse(markets)
 nrow(markets)
 ```
 
-## Prediction Accuracy by Time Bucket
+## Prediction Accuracy
 
 ```{r}
-# Create the accuracy summary
+probability_col <- intersect(
+  c("probability", "yes_probability", "prob", "price"),
+  names(joined)
+)[1]
+
+if (is.na(probability_col)) {
+  stop("Probability column not found")
+}
+
+joined <- joined |>
+  mutate(
+    absolute_error = abs(
+      as.numeric(.data[[probability_col]]) -
+        outcome_numeric
+    )
+  )
+
+joined |>
+  summarise(
+    mean_absolute_error = mean(
+      absolute_error, na.rm = TRUE
+    ),
+    median_absolute_error = median(
+      absolute_error, na.rm = TRUE
+    )
+  )
+```
+
+## Days Until Resolution
+
+```{r}
+snapshot_col <- intersect(
+  c("date", "snapshot_date", "timestamp", "day"),
+  names(joined)
+)[1]
+
+resolution_col <- intersect(
+  c("resolution_date", "resolved_at",
+    "close_date", "end_date"),
+  names(markets)
+)[1]
+
+if (is.na(snapshot_col) || is.na(resolution_col)) {
+  stop("Date columns not found. Inspect names(markets) and names(history).")
+}
+
+if (!resolution_col %in% names(joined)) {
+  joined <- joined |>
+    left_join(
+      markets |>
+        select(market_id, all_of(resolution_col)),
+      by = "market_id"
+    )
+}
+
+joined <- joined |>
+  mutate(
+    days_to_resolution = as.integer(
+      as.Date(.data[[resolution_col]]) -
+        as.Date(.data[[snapshot_col]])
+    )
+  )
+
+joined |>
+  summarise(
+    final_day = sum(
+      days_to_resolution == 0,
+      na.rm = TRUE
+    ),
+    one_to_seven_days = sum(
+      between(days_to_resolution, 1, 7),
+      na.rm = TRUE
+    )
+  )
+```
+
+## Time Horizons
+
+```{r}
+joined <- joined |>
+  mutate(
+    horizon = case_when(
+      days_to_resolution > 90 ~ "More than 90 days",
+      days_to_resolution > 30 ~ "30 to 90 days",
+      days_to_resolution > 7 ~ "7 to 30 days",
+      days_to_resolution >= 1 ~ "1 to 7 days",
+      days_to_resolution == 0 ~ "Final day",
+      TRUE ~ NA_character_
+    ),
+    horizon = factor(
+      horizon,
+      levels = c(
+        "More than 90 days",
+        "30 to 90 days",
+        "7 to 30 days",
+        "1 to 7 days",
+        "Final day"
+      ),
+      ordered = TRUE
+    )
+  )
+
+joined |>
+  count(horizon, .drop = FALSE)
+
 accuracy <- joined |>
+  filter(!is.na(horizon)) |>
   group_by(horizon) |>
   summarise(
     mean_error = mean(absolute_error, na.rm = TRUE),
@@ -81,7 +185,6 @@ accuracy <- joined |>
 
 print(accuracy)
 
-# Create the chart
 ggplot(
   accuracy,
   aes(x = time_bucket, y = mean_error, group = 1)
@@ -98,6 +201,18 @@ ggplot(
   theme(
     plot.title = element_text(face = "bold"),
     axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+```{r}
+joined |>
+  filter(days_to_resolution == 0) |>
+  ggplot(aes(x = probability)) +
+  geom_histogram(binwidth = 0.05, boundary = 0) +
+  labs(
+    title = "Final-day forecast probabilities",
+    x = "Probability",
+    y = "Number of forecasts"
   )
 ```
 
